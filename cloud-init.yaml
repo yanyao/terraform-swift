@@ -1,0 +1,299 @@
+#cloud-config
+# vim: syntax=yaml
+chpasswd:
+  list: |
+    root:passw0rd
+    ubuntu:passw0rd
+  expire: False
+
+write_files:
+-   content: |
+        #!/bin/bash
+        REPO_IP=${1:-192.168.104.85}
+        export HOME=/root/
+        rm -rf /etc/openstack_deploy
+        cat > /etc/apt/sources.list <<EOF
+        deb http://mirrors.ustc.edu.cn/ubuntu xenial main universe
+        deb http://mirrors.ustc.edu.cn/ubuntu xenial-updates main universe
+        deb http://mirrors.ustc.edu.cn/ubuntu xenial-security main universe
+        EOF
+        apt-get update
+        apt-get -y install linux-image-extra-`uname -r`
+        cd /root
+        git clone http://github.com/yanyao/openstack-ansible
+        cat > /etc/apt/apt.conf.d/00allowunauthenticeted <<EOF
+        Apt::Get::AllowUnauthenticated "True";
+        EOF
+
+        echo  "$REPO_IP repo" >> /etc/hosts
+
+        cat   > /etc/apt/sources.list <<EOF
+        deb http://repo:8181/xenial-repo /
+        EOF
+        cd openstack-ansible
+        export GET_PIP_URL="https://raw.githubusercontent.com/pypa/get-pip/master/get-pip.py"
+        ./scripts/bootstrap-ansible.sh
+        #patch ansible roles
+        if [[ -d startcloud-patch ]];then
+          cd startcloud-patch
+          ./patch.sh
+          cd ..
+        fi
+        export SCENARIO='aio'
+        if [[ -f /root/bootstrap-aio.yml ]];then
+          cp -f /root/bootstrap-aio.yml tests/
+        fi
+        ./scripts/bootstrap-aio.sh
+        #patch our own user_varialbes file
+        if [[ -f /root/user_variables.yml ]];then
+            cp /root/user_variables.yml /etc/openstack_deploy/
+        fi
+        for i in {b..d};do mkdir -p /srv/node/vd$i; mkfs.xfs -f -i size=1024 -L vd$i /dev/vd$i;echo "LABEL=vd$i /srv/node/vd$i xfs noatime,nodiratime,nobarrier,logbufs=8 0 0" >> /etc/fstab ;done
+        mount -a
+        if [[ -f /root/swift.yml ]];then
+            cp /root/swift.yml /etc/openstack_deploy/conf.d/
+        fi
+        cd /root/openstack-ansible/playbooks
+        sed -i '/security/d' setup-hosts.yml
+        sed -i '/repo/d' setup-infrastructure.yml
+        sed -i '/tempest/d' setup-openstack.yml
+        openstack-ansible setup-hosts.yml
+        openstack-ansible rabbitmq-install.yml --skip-tags rabbitmq-apt-keys,rabbitmq-repos
+        openstack-ansible setup-infrastructure.yml --skip-tags rabbitmq-apt-keys,rabbitmq-repos,galera-client-apt-keys,galera-client-repos,galera-apt-keys,percona-repos,galera-repos
+        openstack-ansible setup-openstack.yml  --skip-tags rabbitmq-apt-keys,rabbitmq-repos,galera-client-apt-keys,galera-client-repos,galera-apt-keys,percona-repos,galera-repos
+    path: /root/setup.sh
+    permissions: '0755'
+
+-   content: |
+      - name: Bootstrap the All-In-One (AIO)
+        hosts: localhost
+        gather_facts: True
+        user: root
+        roles:
+          - role: "sshd"
+          - role: "pip_install"
+          - role: "bootstrap-host"
+        vars:
+          bootstrap_host_loopback_swift: no
+          bootstrap_host_loopback_cinder: no
+          bootstrap_host_loopback_nova: no
+          uca_enable: false
+          openstack_confd_entries: "{{ confd_overrides[bootstrap_host_scenario] }}"
+          bootstrap_host_scenario: "{{ lookup('env','SCENARIO') | default('aio', true) }}"
+          confd_overrides:
+            aio:
+              - name: horizon.yml.aio
+              - name: keystone.yml.aio
+              - name: swift.yml.aio
+          sftp_subsystem: "{{ (ansible_pkg_mgr == 'apt') | ternary('sftp /usr/lib/openssh/sftp-server','sftp /usr/libexec/openssh/sftp-server') }}"
+          sshd:
+            ListenAddress:
+              - 0.0.0.0
+              - '::'
+            Port: 22
+            Protocol: 2
+            HostKey:
+              - "/etc/ssh/ssh_host_rsa_key"
+              - "/etc/ssh/ssh_host_ecdsa_key"
+              - "/etc/ssh/ssh_host_ed25519_key"
+            UsePrivilegeSeparation: yes
+            KeyRegenerationInterval: 3600
+            ServerKeyBits: 1024
+            SyslogFacility: "AUTH"
+            LogLevel: "INFO"
+            LoginGraceTime: 120
+            StrictModes: yes
+            RSAAuthentication: yes
+            PubkeyAuthentication: yes
+            IgnoreRhosts: yes
+            RhostsRSAAuthentication: no
+            HostbasedAuthentication: no
+            PermitEmptyPasswords: no
+            PermitRootLogin: yes
+            ChallengeResponseAuthentication: no
+            PasswordAuthentication: yes
+            X11DisplayOffset: 10
+            PrintMotd: no
+            PrintLastLog: no
+            TCPKeepAlive: yes
+            AcceptEnv: "LANG LC_*"
+            Subsystem: "{{ sftp_subsystem }}"
+            UsePAM: yes
+            UseDNS: no
+            X11Forwarding: no
+            Compression: yes
+            CompressionLevel: 6
+            MaxSessions: 100
+            MaxStartups: "100:100:100"
+            GSSAPIAuthentication: no
+            GSSAPICleanupCredentials: no
+    path: /root/bootstrap-aio.yml
+    permissions: '0755'
+
+-   content: |
+        ## General options
+        debug: True
+
+        ## Tempest settings
+        tempest_public_subnet_cidr: 172.29.248.0/22
+        tempest_public_subnet_allocation_pools: "172.29.249.110-172.29.249.200"
+
+        ## Galera settings
+        galera_innodb_buffer_pool_size: 256M
+        galera_innodb_log_buffer_size: 32M
+        galera_wsrep_provider_options:
+         - { option: "gcache.size", value: "32M" }
+
+        ## Neutron settings
+        neutron_metadata_checksum_fix: True
+
+        ## Set workers for all services to optimise memory usage
+        ceilometer_notification_workers: 2
+        cinder_osapi_volume_workers: 2
+        glance_api_threads: 2
+        heat_api_threads: 2
+        horizon_wsgi_processes: 2
+        horizon_wsgi_threads: 2
+        keystone_wsgi_processes: 2
+        neutron_api_workers: 2
+        neutron_metadata_workers: 1
+        neutron_rpc_workers: 1
+        nova_api_threads: 2
+        nova_wsgi_processes: 2
+        nova_api_threads: 2
+        nova_wsgi_processes: 2
+        repo_nginx_threads: 2
+        swift_account_server_workers: 2
+        swift_container_server_workers: 2
+        swift_object_server_workers: 2
+        swift_proxy_server_workers: 2
+
+        # NOTE: hpcloud-b4's eth0 uses 10.0.3.0/24, which overlaps with the
+        #       lxc_net_address default
+        # TODO: We'll need to implement a mechanism to determine valid lxc_net_address
+        #       value which will not overlap with an IP already assigned to the host.
+        lxc_net_address: 10.255.255.1
+        lxc_net_netmask: 255.255.255.0
+        lxc_net_dhcp_range: 10.255.255.2,10.255.255.253
+
+
+        ## Ubuntu Cloud Archive mirror to use
+        uca_apt_repo_url: http://ubuntu-cloud.archive.canonical.com/ubuntu
+
+
+        ## Package cache timeout
+        cache_timeout: 600
+
+
+        # The container backing store is set to 'overlayfs' to speed up the
+        # AIO build time.
+        lxc_container_backing_store: "overlayfs"
+
+        ## Enable LBaaSv2 in the AIO
+        neutron_plugin_base:
+          - router
+          - metering
+          - neutron_lbaas.services.loadbalancer.plugin.LoadBalancerPluginv2
+        openstack_repo_url: http://repo:8181
+        pip_upstream_url: http://repo:8181/downloads/get-pip.py
+        pip_links:
+           - name: "openstack_release"
+             link: "{{ openstack_repo_url }}/os-releases/{{ openstack_release }}/ubuntu-16.04-x86_64"
+        pip_lock_to_internal_repo: true
+        haproxy_ssl: true
+        haproxy_hatop_download_url: "http://repo:8181/downloads/hatop-0.7.7.tar.gz"
+        repo_pkg_cache_enabled: false
+        lxc_cache_install_debconf: '-o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --force-yes --allow-unauthenticated '
+        repo_pkg_cache_enabled: false
+        lxc_cache_install_debconf: '-o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --force-yes --allow-unauthenticated '
+        percona_arch_url:
+          #x86_64: "http://repo:8181/downloads/percona-xtrabackup-22_2.2.13-1.vivid_amd64.deb"
+          x86_64: "http://repo:8181/downloads/percona-xtrabackup-24_2.4.5-1.xenial_amd64.deb"
+          ppc64le: "http://repo:8181/downloads/percona-xtrabackup-22_2.2.13-1_ppc64el.deb"
+        qpress_arch_url:
+          x86_64: "http://repo:8181/downloads/qpress_11-1.xenial_amd64.deb"
+          ppc64le: "http://repo:8181/downloads/qpress_11-1_ppc64el.deb"
+        #_rabbitmq_package_url: "http://repo:8181/downloads/rabbitmq-server_3.6.5-1_all.deb"
+        _rabbitmq_package_url: "http://repo:8181/downloads/rabbitmq-server_3.6.9-1_all.deb"
+        nova_uca_enable: false
+        uca_enable: false
+        neutron_uca_enable: false
+        nova_console_type: novnc
+        nova_novncproxy_git_repo: "git://repo:9418/novnc"
+        tempest_img_url: "http://repo:8181/images/cirros-{{ cirros_version }}-x86_64-disk.img"
+        tempest_install: yes
+        tempest_run: no
+
+        ## ceph-ansible AIO settings
+        common_single_host_mode: true
+        monitor_interface: eth1 # Management network in the AIO
+        public_network: "172.29.236.0/22"
+        journal_size: 100
+        journal_collocation: true
+        pool_default_pg_num: 32
+        openstack_config: true # Ceph ansible automatically creates pools & keys
+        cinder_ceph_client: cinder
+        cinder_default_volume_type: RBD
+        glance_ceph_client: glance
+        glance_default_store: rbd
+        glance_ceph_client: glance
+        glance_default_store: rbd
+        glance_rbd_store_pool: images
+        nova_libvirt_images_rbd_pool: vms
+        nfs_file_gw: False
+        #pip_install_upper_constraints: "http://repo:8181/requirements.txt"
+        #lxc_image_cache_server: "https://mirrors.tuna.tsinghua.edu.cn/lxc-images/"
+        lxc_image_cache_server: "http://repo:8181/lxc-images/"
+        openstack_release: "master"
+
+
+    path: /root/user_variables.yml
+    permissions: '0755'
+
+
+
+
+
+-   content: |
+      global_overrides:
+        swift:
+          part_power: 8
+          storage_network: 'br-storage'
+          replication_network: 'br-storage'
+          drives:
+            - name: vdb
+            - name: vdc
+            - name: vde
+          mount_point: /srv/node
+          storage_policies:
+            - policy:
+                name: default
+                index: 0
+                default: True
+      swift-proxy_hosts:
+        aio1:
+          ip: 172.29.236.100
+          container_vars:
+            swift_proxy_vars:
+              limit_container_types: swift_proxy
+              read_affinity: "r1=100"
+              write_affinity: "r1"
+              write_affinity_node_count: "1 * replicas"
+      swift_hosts:
+        aio1:
+          ip: 172.29.236.100
+          container_vars:
+            swift_vars:
+              limit_container_types: swift
+              zone: 0
+              region: 1
+    path: /root/swift.yml
+    permissions: '0755'
+
+runcmd:
+ - tmux set-option -g history-limit 10000
+ - tmux -l new-session -s openstack -n setup -d
+ - tmux set set-remain-on-exit on
+#- tmux -l neww '/root/setup.sh'
+ - tmux send-keys -t openstack:setup '/root/setup.sh' C-m
+
